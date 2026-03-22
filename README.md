@@ -29,4 +29,5 @@ transformer_digital_twin/
 **📊 The Proof: Hysteresis in Action**
 As seen in the telemetry data, when the simulated core temperature crosses the 75°C threshold, the PLC successfully triggers Fan Stage 1. The hysteresis logic holds the fan ON until the temperature safely drops to 70°C, creating a perfect industrial control sawtooth wave.
 
-<img width="652" height="437" alt="image_2026-03-19_17-14-48" src="https://github.com/user-attachments/assets/fb6c3bbe-7f2f-45e3-9fef-4d391f6d5b66" />
+<img width="1737" height="784" alt="image_2026-03-19_17-32-04" src="https://github.com/user-attachments/assets/5713587e-1e70-49df-b5a4-4897bac2aa63" />
+
