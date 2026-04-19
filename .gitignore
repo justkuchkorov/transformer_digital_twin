@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Session telemetry logs (keep only main telemetry.csv)
+transformer_digital_twin/data/telemetry_*.csv
+
+# Power BI temp
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local working copies (root-level duplicates of tracked subfolder)
+/dashboard/
+/data/
+/plc/
+/python/
