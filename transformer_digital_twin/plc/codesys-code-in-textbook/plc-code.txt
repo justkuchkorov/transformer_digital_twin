@@ -1,0 +1,167 @@
+// ============================================================
+// TRANSFORMER THERMAL CONTROLLER — PID + PROTECTION LOGIC
+// IEC 61131-3 Structured Text (CODESYS)
+// ============================================================
+// Upgraded from simple ON/OFF to PID cooling control with:
+//   - PID fan speed output (0-100%)
+//   - Staged fan activation with hysteresis
+//   - Rate-of-rise early warning alarm
+//   - Watchdog timer (safe state if Python twin stops)
+//   - Manual alarm reset input
+//   - Scaled REAL arithmetic (Modbus registers ×100)
+// ============================================================
+
+PROGRAM PLC_PRG
+VAR
+    // --- Modbus I/O (Holding Registers written by Python, ×100 scaled) ---
+    Raw_Temp_x100       : WORD;          // Holding Register 0: core temp × 100
+    Raw_Load_x100       : WORD;          // Holding Register 1: load % × 100
+    Raw_Ambient_x100    : WORD;          // Holding Register 2: ambient temp × 100
+
+    // --- Decoded REAL values ---
+    Core_Temp           : REAL;          // Decoded core temperature (°C)
+    Load_Percent        : REAL;          // Decoded load (%)
+    Ambient_Temp        : REAL;          // Decoded ambient (°C)
+
+    // --- PID Controller ---
+    PID_Setpoint        : REAL := 72.0;  // Target temp (°C) — keep below Fan Stage 2
+    PID_Kp              : REAL := 4.0;   // Proportional gain
+    PID_Ki              : REAL := 0.15;  // Integral gain
+    PID_Kd              : REAL := 1.0;   // Derivative gain
+    PID_Error           : REAL;          // Current error
+    PID_Prev_Error      : REAL := 0.0;   // Previous error (for D term)
+    PID_Integral        : REAL := 0.0;   // Accumulated integral
+    PID_Derivative      : REAL;          // Derivative term
+    PID_Output          : REAL;          // Raw PID output
+    Cooling_Effort      : REAL;          // Clamped 0-100%
+
+    // --- Fan Outputs ---
+    Fan_Stage_1         : WORD;          // Input Register 0: fan 1 state (0 or 1)
+    Fan_Stage_2         : WORD;          // Input Register 1: fan 2 state (0 or 1)
+    Fan_Speed_Pct       : WORD;          // Input Register 3: fan 1 speed (0-100)
+    Critical_Alarm      : WORD;          // Input Register 2: critical alarm (0 or 1)
+
+    // --- Rate-of-Rise Detection ---
+    Prev_Temp           : REAL := 25.0;  // Previous cycle temperature
+    Temp_Rate           : REAL;          // °C per cycle (°C/s at 1 Hz)
+    RATE_ALARM_THRESHOLD: REAL := 3.0;   // °C/s — early warning if rising too fast
+    Rate_Alarm          : WORD;          // Input Register 4: rate-of-rise alarm
+
+    // --- Watchdog ---
+    Watchdog_Counter    : WORD := 0;     // Increments each cycle Python doesn't update
+    Watchdog_Last_Temp  : WORD := 0;     // Last raw temp value seen
+    WATCHDOG_LIMIT      : WORD := 10;    // Cycles before safe state (10s at 1 Hz)
+    Watchdog_Tripped    : BOOL := FALSE;
+
+    // --- Alarm Reset (set by external input or HMI) ---
+    Alarm_Reset         : BOOL := FALSE; // Set TRUE to clear latched alarms
+END_VAR
+
+// ============================================================
+// STEP 0: DECODE MODBUS VALUES (÷100 to get REAL)
+// ============================================================
+Core_Temp    := WORD_TO_REAL(Raw_Temp_x100) / 100.0;
+Load_Percent := WORD_TO_REAL(Raw_Load_x100) / 100.0;
+Ambient_Temp := WORD_TO_REAL(Raw_Ambient_x100) / 100.0;
+
+// ============================================================
+// STEP 1: WATCHDOG — detect if Python twin stopped sending
+// ============================================================
+IF Raw_Temp_x100 = Watchdog_Last_Temp THEN
+    Watchdog_Counter := Watchdog_Counter + 1;
+ELSE
+    Watchdog_Counter := 0;
+    Watchdog_Last_Temp := Raw_Temp_x100;
+END_IF;
+
+IF Watchdog_Counter >= WATCHDOG_LIMIT THEN
+    Watchdog_Tripped := TRUE;
+END_IF;
+
+// If watchdog tripped: safe state — all cooling ON, alarm active
+IF Watchdog_Tripped THEN
+    Fan_Stage_1    := 1;
+    Fan_Stage_2    := 1;
+    Fan_Speed_Pct  := 100;
+    Critical_Alarm := 1;
+    Rate_Alarm     := 0;
+    RETURN;  // Skip all other logic
+END_IF;
+
+// ============================================================
+// STEP 2: RATE-OF-RISE DETECTION
+// ============================================================
+Temp_Rate := Core_Temp - Prev_Temp;
+Prev_Temp := Core_Temp;
+
+IF Temp_Rate > RATE_ALARM_THRESHOLD THEN
+    Rate_Alarm := 1;
+ELSE
+    Rate_Alarm := 0;
+END_IF;
+
+// ============================================================
+// STEP 3: PID COOLING CONTROLLER
+// ============================================================
+// Error: positive when temp is ABOVE setpoint (need more cooling)
+PID_Error := Core_Temp - PID_Setpoint;
+
+// Integral with anti-windup clamp
+PID_Integral := PID_Integral + PID_Error;
+IF PID_Integral > 500.0 THEN
+    PID_Integral := 500.0;
+ELSIF PID_Integral < 0.0 THEN
+    PID_Integral := 0.0;
+END_IF;
+
+// Derivative (rate of error change)
+PID_Derivative := PID_Error - PID_Prev_Error;
+PID_Prev_Error := PID_Error;
+
+// PID output
+PID_Output := (PID_Kp * PID_Error) + (PID_Ki * PID_Integral) + (PID_Kd * PID_Derivative);
+
+// Clamp to 0-100%
+IF PID_Output > 100.0 THEN
+    Cooling_Effort := 100.0;
+ELSIF PID_Output < 0.0 THEN
+    Cooling_Effort := 0.0;
+ELSE
+    Cooling_Effort := PID_Output;
+END_IF;
+
+// ============================================================
+// STEP 4: STAGED FAN ACTIVATION (with hysteresis)
+// ============================================================
+// Fan Stage 1: activates when PID requests cooling (>5%)
+// Speed is modulated by PID output
+IF Cooling_Effort > 5.0 THEN
+    Fan_Stage_1   := 1;
+    Fan_Speed_Pct := REAL_TO_WORD(Cooling_Effort);
+ELSIF Cooling_Effort < 2.0 THEN
+    Fan_Stage_1   := 0;
+    Fan_Speed_Pct := 0;
+END_IF;
+
+// Fan Stage 2: hard ON/OFF backup when PID alone can't keep up
+// (same hysteresis thresholds as original, but now as backup layer)
+IF Core_Temp >= 90.0 THEN
+    Fan_Stage_2 := 1;
+ELSIF Core_Temp <= 85.0 THEN
+    Fan_Stage_2 := 0;
+END_IF;
+
+// ============================================================
+// STEP 5: CRITICAL ALARM (latching with manual reset)
+// ============================================================
+IF Core_Temp >= 105.0 THEN
+    Critical_Alarm := 1;
+END_IF;
+
+// Manual reset — only works if temperature has dropped below 80°C
+IF Alarm_Reset AND Core_Temp < 80.0 THEN
+    Critical_Alarm   := 0;
+    Watchdog_Tripped := FALSE;
+    PID_Integral     := 0.0;
+    Alarm_Reset      := FALSE;
+END_IF;
